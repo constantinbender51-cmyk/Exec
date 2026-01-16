@@ -1,1 +1,1 @@
-web: python octopus.py
+web: python exec.py
