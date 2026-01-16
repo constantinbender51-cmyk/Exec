@@ -34,13 +34,13 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 LEVERAGE = 70.0
-SIGNAL_FEED_URL = "http://localhost:8080" 
+SIGNAL_FEED_URL = "http://signalsexec.up.railway.app:8080" 
 
 # Asset Mapping (Feed Ticker -> Kraken Futures Perpetual)
 # Updated to match scheduler.py tickers ("BTC", "ETH")
 SYMBOL_MAP = {
     # --- Majors ---
-    "BTC": "ff_xbtusd_260327",
+    "BTC": "pf_xbtusd",
     "ETH": "pf_ethusd",
     "SOL": "pf_solusd",
     "BNB": "pf_bnbusd",
