@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Octopus: Remote Signal Aggregator & Execution Engine.
-Fetches signals from 'https://octopus-feed.up.railway.app/'
-- REMOVED: Local Training, JSON loading, Pandas Resampling.
-- ADDED: HTML Scraping, Signal Parsing.
-- RETAINED: Kraken Futures Execution, Maker Loop, Risk Management.
+Exec: Remote Signal Aggregator & Execution Engine.
+Fetches signals from 'http://localhost:8080' (scheduler.py)
 """
 
 import os
@@ -15,12 +12,11 @@ import logging
 import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, Tuple
 
 # --- Local Imports ---
 try:
     from kraken_futures import KrakenFuturesApi
-    import stress_test
 except ImportError as e:
     print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' is in the directory.")
     sys.exit(1)
@@ -37,102 +33,90 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-LEVERAGE = 70
-SIGNAL_FEED_URL = "https://octopus-feed.up.railway.app/"
+LEVERAGE = 70.0
+SIGNAL_FEED_URL = "http://localhost:8080" 
 
-# Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
+# Asset Mapping (Feed Ticker -> Kraken Futures Perpetual)
+# Updated to match scheduler.py tickers ("BTC", "ETH")
 SYMBOL_MAP = {
     # --- Majors ---
-    "BTCUSDT": "ff_xbtusd_260327", # Kept your existing fixed maturity preference
-    "ETHUSDT": "pf_ethusd",
-    "SOLUSDT": "pf_solusd",
-    "BNBUSDT": "pf_bnbusd",
-    "XRPUSDT": "pf_xrpusd",
-    "ADAUSDT": "pf_adausd",
+    "BTC": "ff_xbtusd_260327",
+    "ETH": "pf_ethusd",
+    "SOL": "pf_solusd",
+    "BNB": "pf_bnbusd",
+    "XRP": "pf_xrpusd",
+    "ADA": "pf_adausd",
     
-    # --- Alts (Existing) ---
-    "DOGEUSDT": "pf_dogeusd",
-    "AVAXUSDT": "pf_avaxusd",
-    "DOTUSDT": "pf_dotusd",
-    "LINKUSDT": "pf_linkusd",
-
-    # --- NEWLY ADDED (Expanded Universe) ---
-    "TRXUSDT": "pf_trxusd",
-    "BCHUSDT": "pf_bchusd",
-    "XLMUSDT": "pf_xlmusd",
-    "LTCUSDT": "pf_ltcusd",
-    "SUIUSDT": "pf_suiusd",
-    "HBARUSDT": "pf_hbarusd",
-    "SHIBUSDT": "pf_shibusd", 
-    "TONUSDT": "pf_tonusd",
-    "UNIUSDT": "pf_uniusd",
-    "ZECUSDT": "pf_zecusd",
+    # --- Alts ---
+    "DOGE": "pf_dogeusd",
+    "AVAX": "pf_avaxusd",
+    "DOT": "pf_dotusd",
+    "LINK": "pf_linkusd",
+    "TRX": "pf_trxusd",
+    "BCH": "pf_bchusd",
+    "XLM": "pf_xlmusd",
+    "LTC": "pf_ltcusd",
+    "SUI": "pf_suiusd",
+    "HBAR": "pf_hbarusd",
+    "SHIB": "pf_shibusd", 
+    "TON": "pf_tonusd",
+    "UNI": "pf_uniusd",
+    "ZEC": "pf_zecusd",
 }
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    handlers=[logging.FileHandler("octopus.log"), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.FileHandler("exec.log"), logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("Octopus")
+logger = logging.getLogger("Exec")
 
 # --- Signal Fetcher ---
 
 class SignalFetcher:
     def __init__(self, url):
         self.url = url
-        # Regex to find the main table rows
-        self.row_pattern = re.compile(r"<tr>\s*<td>(.*?)</td>(.*?)</tr>", re.DOTALL)
-        # Regex to find cells within a row
-        self.cell_pattern = re.compile(r"<td class='(.*?)'>(.*?)</td>", re.DOTALL)
+        # Regex to capture: "BTC: 2 ..."
+        self.line_pattern = re.compile(r"^([A-Z]+):\s*(-?\d+)")
 
-    def fetch_signals(self) -> Dict[str, int]:
+    def fetch_signals(self) -> Tuple[Dict[str, int], int]:
         """
-        Scrapes the website and returns a dictionary of Net Votes per Asset.
-        Returns: { "BTCUSDT": 2, "ETHUSDT": -1, ... }
-        Also returns the total count of strategies (cells) found for sizing.
+        Parses text output from scheduler.py.
+        Returns:
+            - asset_votes: { "BTC": 2, "ETH": -1 }
+            - ticker_count: The number of active tickers (e.g., 3 for BTC, ETH, SOL)
         """
         try:
             logger.info(f"Fetching signals from {self.url}...")
-            resp = requests.get(self.url, timeout=10)
+            resp = requests.get(self.url, timeout=5)
             resp.raise_for_status()
-            html = resp.text
+            text_lines = resp.text.splitlines()
 
-            # Parse Table
-            matches = self.row_pattern.findall(html)
-            
             asset_votes = {}
-            total_strategies = 0
-
-            for asset_name, cells_html in matches:
-                if asset_name not in SYMBOL_MAP:
-                    continue
-
-                cells = self.cell_pattern.findall(cells_html)
-                net_vote = 0
-                
-                for cls, txt in cells:
-                    total_strategies += 1
-                    txt = txt.strip().upper()
-                    
-                    if "BUY" in txt:
-                        net_vote += 1
-                    elif "SELL" in txt:
-                        net_vote -= 1
-                    # WAIT/NEUTRAL is 0
-
-                asset_votes[asset_name] = net_vote
             
-            logger.info(f"Parsed {total_strategies} total strategy cells.")
-            return asset_votes, total_strategies
+            for line in text_lines:
+                # Line format expected: "BTC: 2 [Components: 1, 1]"
+                match = self.line_pattern.search(line.strip())
+                if match:
+                    ticker = match.group(1)
+                    score = int(match.group(2))
+
+                    if ticker in SYMBOL_MAP:
+                        asset_votes[ticker] = score
+            
+            # Count the number of tickers found (e.g., BTC, ETH, SOL = 3)
+            ticker_count = len(asset_votes)
+            
+            logger.info(f"Parsed {ticker_count} tickers from feed.")
+            return asset_votes, ticker_count
 
         except Exception as e:
             logger.error(f"Failed to fetch signals: {e}")
             return {}, 0
 
-# --- Main Octopus Engine ---
+# --- Main Exec Engine ---
 
-class Octopus:
+class Exec:
     def __init__(self):
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
         self.fetcher = SignalFetcher(SIGNAL_FEED_URL)
@@ -140,11 +124,10 @@ class Octopus:
         self.instrument_specs = {}
 
     def initialize(self):
-        logger.info("Initializing Octopus (Remote Feed Mode)...")
+        logger.info("Initializing Exec Engine...")
         self._fetch_instrument_specs()
         
-        # Stress Test (Optional, keeps connection warm)
-        logger.info("Checking API Connection...")
+        # Check Connection
         try:
             acc = self.kf.get_accounts()
             if "error" in acc:
@@ -153,8 +136,6 @@ class Octopus:
                 logger.info("API Connection Successful.")
         except Exception as e:
             logger.error(f"API Connection Failed: {e}")
-
-        logger.info("Initialization Complete. Bot ready.")
 
     def _fetch_instrument_specs(self):
         try:
@@ -186,32 +167,30 @@ class Octopus:
         return rounded
 
     def run(self):
-        logger.info("Bot started. Syncing with 15m intervals...")
+        logger.info("Exec Engine started. Syncing with 15m intervals...")
         while True:
             now = datetime.now(timezone.utc)
             
-            # Trigger every 15 minutes at second 30 (giving server time to update)
-            # Feed updates at 25s, so we wait until 30s to be safe.
+            # Trigger every 15 minutes at second 30
             if now.minute % 15 == 0 and 30 <= now.second < 35:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
-                
                 self._process_signals()
-                
-                time.sleep(50) # Prevent double trigger
-                
+                time.sleep(50) 
+            
             time.sleep(1) 
 
     def _process_signals(self):
-        # 1. Fetch Signals
-        asset_votes, total_strategies = self.fetcher.fetch_signals()
+        # 1. Fetch Signals from Scheduler
+        asset_votes, active_strategies = self.fetcher.fetch_signals()
         
-        if total_strategies == 0:
-            logger.warning("No strategies found on feed. Skipping execution.")
+        if active_strategies == 0:
+            logger.warning("No active strategies found. Skipping execution.")
             return
 
         # 2. Get Account Equity
         try:
             acc = self.kf.get_accounts()
+            # Handle Flex vs Single-Collateral response structures
             if "flex" in acc.get("accounts", {}):
                 equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
             elif "accounts" in acc:
@@ -221,27 +200,28 @@ class Octopus:
                 equity = 0
                 
             if equity <= 0:
-                logger.error("Equity 0. Aborting.")
+                logger.error("Equity <= 0. Aborting.")
                 return
         except Exception as e:
             logger.error(f"Account fetch failed: {e}")
             return
 
-        # 3. Calculate Unit Size
-        # Formula: (Equity * Leverage) / Total Cells in Matrix
-        unit_size_usd = (equity * LEVERAGE) / total_strategies
-        logger.info(f"Equity: ${equity:.2f} | Strategies: {total_strategies} | Unit: ${unit_size_usd:.2f}")
-
-        # 4. Execute per Asset
-        # Use Sprint settings (faster execution) as this is a reactive update
+        # 3. Execution Loop
+        logger.info(f"Equity: ${equity:.2f} | Active Strategies (Count): {active_strategies}")
+        
+        # Execution Settings
         exec_duration = 60
         exec_interval = 5
         start_offset_bp = 0 
         step_bp = 1.0 
 
-        for asset, net_vote in asset_votes.items():
-            target_usd = net_vote * unit_size_usd
-            logger.info(f"[{asset}] Net Vote: {net_vote} -> Target Alloc: ${target_usd:.2f}")
+        for asset, signal_sum in asset_votes.items():
+            # FORMULA: (Leverage * SignalSum * MarginEquity) / ActiveStrategies
+            # ActiveStrategies = The count of tickers (e.g. 3)
+            
+            target_usd = (LEVERAGE * signal_sum * equity) / active_strategies
+            
+            logger.info(f"[{asset}] SignalSum: {signal_sum} -> Target Alloc: ${target_usd:.2f}")
             
             self.executor.submit(
                 self._execute_single_asset_logic, 
@@ -253,9 +233,9 @@ class Octopus:
                 step_bp
             )
 
-    def _execute_single_asset_logic(self, binance_asset: str, net_target_usd: float, 
+    def _execute_single_asset_logic(self, ticker: str, net_target_usd: float, 
                                     duration: int, interval: int, start_bp: float, step_bp: float):
-        kf_symbol = SYMBOL_MAP.get(binance_asset)
+        kf_symbol = SYMBOL_MAP.get(ticker)
         if not kf_symbol: return
 
         try:
@@ -360,6 +340,6 @@ class Octopus:
             except: pass
 
 if __name__ == "__main__":
-    bot = Octopus()
+    bot = Exec()
     bot.initialize()
     bot.run()
